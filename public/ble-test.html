@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>워치 BLE 심박수 테스트</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0a0a;
+      color: white;
+      font-family: -apple-system, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      gap: 32px;
+    }
+    h1 { font-size: 24px; color: #ef4444; text-align: center; }
+    p { color: #9ca3af; text-align: center; font-size: 14px; line-height: 1.6; }
+    #bpm-display {
+      font-size: 96px;
+      font-weight: 900;
+      font-family: monospace;
+      color: white;
+      text-shadow: 0 0 30px rgba(239,68,68,0.8);
+    }
+    #status {
+      font-size: 16px;
+      color: #6b7280;
+      text-align: center;
+    }
+    button {
+      padding: 16px 40px;
+      font-size: 18px;
+      font-weight: bold;
+      border: 2px solid #ef4444;
+      background: transparent;
+      color: white;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover { background: #ef4444; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #log {
+      width: 100%;
+      max-width: 400px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 13px;
+      color: #9ca3af;
+      line-height: 1.8;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .success { color: #22c55e; }
+    .error { color: #ef4444; }
+    .info { color: #60a5fa; }
+  </style>
+</head>
+<body>
+  <h1>❤️ 워치 BLE 심박수 테스트</h1>
+  <p>워치를 착용한 상태에서<br/>아래 버튼을 눌러 연결을 시도하세요.</p>
+
+  <div id="bpm-display">---</div>
+  <div id="status">연결 대기 중</div>
+
+  <button id="btn" onclick="connect()">🔵 워치에 연결하기</button>
+
+  <div id="log">로그가 여기 표시됩니다...</div>
+
+  <script>
+    const display = document.getElementById('bpm-display');
+    const status  = document.getElementById('status');
+    const log     = document.getElementById('log');
+    const btn     = document.getElementById('btn');
+
+    function addLog(msg, type = '') {
+      const line = document.createElement('div');
+      line.className = type;
+      line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function connect() {
+      if (!navigator.bluetooth) {
+        addLog('❌ 이 브라우저는 Web Bluetooth를 지원하지 않습니다.\n크롬(Chrome)을 사용해 주세요.', 'error');
+        return;
+      }
+
+      btn.disabled = true;
+      status.textContent = '워치 검색 중...';
+      addLog('블루투스 기기 검색 시작...', 'info');
+
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: ['heart_rate'] }],
+          // 필터 없이 전체 검색도 시도
+          optionalServices: ['heart_rate', 0x180D]
+        });
+
+        addLog('✅ 기기 발견: ' + device.name, 'success');
+        status.textContent = '연결 중...';
+
+        const server = await device.gatt.connect();
+        addLog('✅ GATT 서버 연결됨', 'success');
+
+        const service = await server.getPrimaryService('heart_rate');
+        addLog('✅ Heart Rate 서비스 발견! (BLE 호환 가능)', 'success');
+
+        const characteristic = await service.getCharacteristic('heart_rate_measurement');
+        addLog('✅ 심박수 측정값 수신 시작', 'success');
+
+        status.textContent = '🔴 실시간 심박수 수신 중';
+        btn.textContent = '연결됨';
+
+        characteristic.addEventListener('characteristicvaluechanged', (event) => {
+          const value = event.target.value;
+          const flags = value.getUint8(0);
+          const bpm = flags & 0x01 ? value.getUint16(1, true) : value.getUint8(1);
+          display.textContent = bpm;
+          addLog('💓 심박수: ' + bpm + ' BPM', 'success');
+        });
+
+        await characteristic.startNotifications();
+
+      } catch (err) {
+        if (err.name === 'NotFoundError') {
+          addLog('❌ 워치를 찾을 수 없습니다.\n→ 워치가 심박수 BLE 표준을 지원하지 않습니다.', 'error');
+          addLog('→ 탭(Tap) BPM 방식으로 전환이 필요합니다.', 'info');
+          status.textContent = '연결 실패 - 기기 미지원';
+        } else if (err.name === 'NotAllowedError') {
+          addLog('⚠️ 사용자가 연결을 취소했습니다.', 'error');
+          status.textContent = '취소됨';
+        } else {
+          addLog('❌ 오류: ' + err.message, 'error');
+          status.textContent = '오류 발생';
+        }
+        btn.disabled = false;
+        btn.textContent = '🔵 다시 시도';
+      }
+    }
+  </script>
+</body>
+</html>

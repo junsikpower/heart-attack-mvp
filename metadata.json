@@ -1,0 +1,5 @@
+{
+  "name": "Heart Attack",
+  "description": "A real-time matching game where two users try to raise each other's heart rate through conversation.",
+  "requestFramePermissions": []
+}
