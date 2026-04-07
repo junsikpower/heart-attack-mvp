@@ -12,8 +12,8 @@ interface CameraHeartRateResult {
   stopMeasurement: () => void;
 }
 
-const BUFFER_SIZE = 100;
-const FPS_INTERVAL = 1000 / 30; // 30 FPS
+const BUFFER_SIZE = 150; // 약 5초 분량 (30 FPS 기준)
+const FPS_INTERVAL = 1000 / 30; // 30 FPS 타겟
 
 export function useCameraHeartRate(): CameraHeartRateResult {
   const [bpm, setBpm] = useState<number | null>(null);
@@ -28,9 +28,11 @@ export function useCameraHeartRate(): CameraHeartRateResult {
   const rafId = useRef<number | null>(null);
   const lastDrawTime = useRef<number>(0);
   
-  // 상태 변수들을 Ref로 관리하여 requestAnimationFrame 루프 내에서 접근
+  // 알고리즘 변수
   const rawSignalBuffer = useRef<number[]>([]);
+  const timeBuffer = useRef<number[]>([]);
   const peakTimestamps = useRef<number[]>([]);
+  const currentBpmRef = useRef<number | null>(null); // EMA 적용을 위해 직전 BPM 저장
 
   const stopMeasurement = useCallback(() => {
     if (rafId.current) cancelAnimationFrame(rafId.current);
@@ -46,88 +48,123 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     setBpm(null);
     setWaveform([]);
     rawSignalBuffer.current = [];
+    timeBuffer.current = [];
     peakTimestamps.current = [];
+    currentBpmRef.current = null;
   }, []);
 
-  const windowAverage = (arr: number[], size: number) => {
-    if (arr.length < size) return arr[arr.length - 1] || 0;
-    let sum = 0;
-    for (let i = arr.length - size; i < arr.length; i++) {
-        sum += arr[i];
+  const calculateBPM = useCallback(() => {
+    const raw = rawSignalBuffer.current;
+    if (raw.length < 30) return; // 최소 1초 이상의 데이터 수집 대기
+
+    // 1. Data Normalization (실시간 최소/최대값 기준 영점 조정 및 스케일링)
+    // 최근 2초(60프레임) 데이터만 분석하여 환경(광량/압력) 변화에 강건하게 반응
+    const recentRaw = raw.slice(-60);
+    const minRaw = Math.min(...recentRaw);
+    const maxRaw = Math.max(...recentRaw);
+    const range = maxRaw - minRaw;
+
+    // 노이즈(파장이 전혀 없는 상태) 무시
+    if (range < 0.5) return; 
+
+    const filtered: number[] = [];
+    const timestamps = timeBuffer.current;
+
+    for (let i = 0; i < raw.length; i++) {
+        // High-pass 대체: 윈도우 기반 Min/Max 보정으로 DC offset(기울어짐) 제거
+        const normalized = (raw[i] - minRaw) / range;
+        filtered.push(normalized);
     }
-    return sum / size;
-  };
-
-  const calculateBPM = useCallback((timestamp: number) => {
-    const buf = rawSignalBuffer.current;
-    if (buf.length < 5) return;
     
-    // 최근 3포인트씩의 이동 평균을 구하여 기울기 변화를 계산
-    const v0 = windowAverage(buf.slice(0, buf.length - 2), 3);
-    const v1 = windowAverage(buf.slice(0, buf.length - 1), 3);
-    const v2 = windowAverage(buf, 3);
-    
-    // 피크 검출: 값이 올라갔다가 떨어지는 지점 (혈류량 변화)
-    if (v1 > v0 && v1 > v2) {
-        // 노이즈(자잘한 변화) 무시하기 위한 최소 진폭 설정
-        const recentMin = Math.min(...buf.slice(-30));
-        const recentMax = Math.max(...buf.slice(-30));
-        const amplitude = recentMax - recentMin;
+    // 2. Low-pass Filter (Moving Average)
+    // 자잘한 프레임 노이즈 및 손떨림 고주파 제거
+    const smoothed: number[] = [];
+    const windowSize = 5;
+    for (let i = 0; i < filtered.length; i++) {
+        if (i < windowSize) {
+           smoothed.push(filtered[i]);
+        } else {
+           let sum = 0;
+           for(let j=0; j<windowSize; j++) sum += filtered[i-j];
+           smoothed.push(sum / windowSize);
+        }
+    }
 
-        if (amplitude > 1.5 && (v1 - recentMin) > amplitude * 0.6) {
-           // 중복 피크(너무 가까운 피크) 무시 (최소 300ms = 200BPM 제한)
-           const lastPeakTime = peakTimestamps.current[peakTimestamps.current.length - 1] || 0;
-           if (timestamp - lastPeakTime > 300) {
-               peakTimestamps.current.push(timestamp);
-               
-               // 최근 10개의 피크만 저장
-               if (peakTimestamps.current.length > 10) {
-                   peakTimestamps.current.shift();
-               }
-               
-               // 피크 간격을 통해 BPM 단기 계산
-               if (peakTimestamps.current.length >= 3) {
-                   const diffs = [];
-                   for(let i=1; i<peakTimestamps.current.length; i++) {
-                       diffs.push(peakTimestamps.current[i] - peakTimestamps.current[i-1]);
-                   }
-                   const avgDiff = diffs.reduce((a,b)=>a+b, 0) / diffs.length;
-                   const calcBpm = 60000 / avgDiff;
-                   
-                   // 유효한 사람의 심박수 범위 내인 경우만
-                   if (calcBpm > 40 && calcBpm < 220) {
-                       setBpm(Math.round(calcBpm));
-                   }
-               }
-           }
+    // Waveform UI 업데이트 (최근 100프레임)
+    setWaveform(smoothed.slice(-100));
+
+    // 3. Peak Detection (부드러운 신호 위에서 피크 찾기)
+    if (smoothed.length < 3) return;
+    
+    const v0 = smoothed[smoothed.length - 3];
+    const v1 = smoothed[smoothed.length - 2];
+    const v2 = smoothed[smoothed.length - 1];
+    
+    // 진폭이 정규화 평균치(0.5)를 넘는 명확한 최고점인지 검사
+    if (v1 > v0 && v1 > v2 && v1 > 0.4) { 
+        const peakTime = timestamps[timestamps.length - 2];
+        const lastPeakTime = peakTimestamps.current[peakTimestamps.current.length - 1] || 0;
+        
+        // 4. Band-pass Filter (생리학적 주파수 대역 적용)
+        // 0.7Hz ~ 3.5Hz (약 42 BPM ~ 210 BPM)
+        // 피크 간 시간차가 285ms(210 BPM) ~ 1500ms(40 BPM) 이내일 때만 유효 취급
+        const timeDiff = peakTime - lastPeakTime;
+        
+        if (timeDiff > 285 && timeDiff < 1500) {
+            peakTimestamps.current.push(peakTime);
+            if (peakTimestamps.current.length > 5) {
+                peakTimestamps.current.shift();
+            }
+            
+            if (peakTimestamps.current.length >= 3) {
+                const diffs = [];
+                for(let i=1; i<peakTimestamps.current.length; i++) {
+                    diffs.push(peakTimestamps.current[i] - peakTimestamps.current[i-1]);
+                }
+                // 평균 피크 간격으로 BPM 산출
+                const avgDiff = diffs.reduce((a,b)=>a+b, 0) / diffs.length;
+                let newBpm = 60000 / avgDiff;
+                
+                // 5. Physiological Rules (급격한 심박수 변화 차단)
+                if (currentBpmRef.current !== null) {
+                    const oldBpm = currentBpmRef.current;
+                    // 인간의 심박은 1초만에 20% 이상 변하기 어려움 (노이즈 방어)
+                    if (newBpm > oldBpm * 1.2) newBpm = oldBpm * 1.2;
+                    if (newBpm < oldBpm * 0.8) newBpm = oldBpm * 0.8;
+                    
+                    // 6. Exponential Moving Average (EMA) 적용
+                    // 새로운 측정값 비중 30%, 이전 상태 유지 70%로 극강의 부드러움 제공
+                    newBpm = (newBpm * 0.3) + (oldBpm * 0.7);
+                }
+                
+                currentBpmRef.current = newBpm;
+                setBpm(Math.round(newBpm));
+            }
+        } else if (timeDiff > 1500) {
+            // 맥박을 한참 놓쳤거나 신호가 초기화된 경우 기준점 리셋
+            peakTimestamps.current = [peakTime];
         }
     }
   }, []);
 
   const processFrame = useCallback((timestamp: number) => {
-    // DOM에 의존하지 않고 메모리 내의 비디오 요소 사용
     if (!videoElementRef.current || !canvasRef.current) return;
     
-    // 루프 재귀호출은 가장 위에서 보장 (조기 리턴 방지)
+    // 재귀 호출
     rafId.current = requestAnimationFrame(processFrame);
 
-    if (timestamp - lastDrawTime.current < FPS_INTERVAL) {
-        return;
-    }
+    if (timestamp - lastDrawTime.current < FPS_INTERVAL) return;
     lastDrawTime.current = timestamp;
 
     const video = videoElementRef.current;
     const canvas = canvasRef.current;
     
-    // 비디오가 재생 중일때만 처리
-    if (video.videoWidth === 0 || video.videoHeight === 0) {
-        return;
-    }
+    if (video.videoWidth === 0 || video.videoHeight === 0) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // 비디오 중앙 50x50 영역만 캔버스에 복사 (성능 최적화)
+    // 중앙 50x50 추출 최적화
     const sampleSize = 50;
     const sx = Math.max(0, (video.videoWidth - sampleSize) / 2);
     const sy = Math.max(0, (video.videoHeight - sampleSize) / 2);
@@ -137,41 +174,39 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     const imageData = ctx.getImageData(0, 0, sampleSize, sampleSize);
     const data = imageData.data;
     
-    let redSum = 0;
-    let greenSum = 0;
-    let blueSum = 0;
+    let redSum = 0; let greenSum = 0; let blueSum = 0;
     const count = data.length / 4;
 
     for (let i = 0; i < data.length; i += 4) {
-      redSum += data[i];
-      greenSum += data[i+1];
-      blueSum += data[i+2];
+      redSum += data[i]; greenSum += data[i+1]; blueSum += data[i+2];
     }
 
     const redAvg = redSum / count;
     const greenAvg = greenSum / count;
     const blueAvg = blueSum / count;
     
-    // 손가락이 카메라를 완전히 덮었는지 판별하는 간단한 휴리스틱 알고리즘
-    // 피부 조직을 투과한 빛은 빨간색 채널이 압도적으로 높음
-    if (redAvg > 120 && redAvg > greenAvg * 1.5 && redAvg > blueAvg * 1.5) {
+    // 손가락 접촉 판별 (혈류 조직 투과 시 붉은 빛 압도적)
+    if (redAvg > 100 && redAvg > greenAvg * 1.3 && redAvg > blueAvg * 1.3) {
        setStatus('measuring');
        
        rawSignalBuffer.current.push(redAvg);
+       timeBuffer.current.push(timestamp); // 타임스탬프 기록
+       
        if (rawSignalBuffer.current.length > BUFFER_SIZE) {
            rawSignalBuffer.current.shift();
+           timeBuffer.current.shift();
        }
        
-       calculateBPM(timestamp);
+       // 알고리즘 호출
+       calculateBPM();
        
-       // UI 웨이브폼용으로 렌더링하도록 얕은 복사
-       setWaveform([...rawSignalBuffer.current]);
-
     } else {
-       // 손가락이 떼어졌거나 렌즈 중앙에 제대로 위치하지 않은 상태
+       // 손가락이 떨어지거나 부적절할 경우 완벽히 상태 초기화
        setStatus('no_finger');
-       setBpm(null); // 신뢰할 수 없는 데이터 초기화
+       setBpm(null);
+       currentBpmRef.current = null;
        rawSignalBuffer.current = [];
+       timeBuffer.current = [];
        peakTimestamps.current = [];
        setWaveform([]);
     }
@@ -184,13 +219,11 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       
       let stream: MediaStream;
       try {
-          // 1. 강제로 후면 카메라 (exact) 요청
           stream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: { exact: 'environment' } },
             audio: false
           });
       } catch(e) {
-          // 2. 만약 실패할 경우 (PC 등 후면카메라가 없는 기기) 차선책으로 기본 요청
           stream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: 'environment' }, 
             audio: false
@@ -200,7 +233,6 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       streamRef.current = stream;
       setActiveStream(stream);
       
-      // 화면 렌더링과 독립적인 비디오 요소 메모리 생성
       if (!videoElementRef.current) {
         const vid = document.createElement('video');
         vid.setAttribute("playsinline", "true");
@@ -211,7 +243,6 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       videoElementRef.current.srcObject = stream;
       await videoElementRef.current.play();
 
-      // 플래시(Torch) 켜기 시도
       const track = stream.getVideoTracks()[0];
       if (track) {
           try {
@@ -222,11 +253,10 @@ export function useCameraHeartRate(): CameraHeartRateResult {
                  });
               }
           } catch (e) {
-              console.warn("이 브라우저/기기는 카메라 플래시 제어를 지원하지 않습니다.", e);
+              console.warn("이 브라우저는 플래시 제어를 지원하지 않음", e);
           }
       }
       
-      // 처리용 히든 캔버스 준비
       if (!canvasRef.current) {
           canvasRef.current = document.createElement('canvas');
           canvasRef.current.width = 50;
