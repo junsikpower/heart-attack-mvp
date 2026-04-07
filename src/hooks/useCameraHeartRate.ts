@@ -8,8 +8,10 @@ interface CameraHeartRateResult {
   waveform: number[];
   error: string | null;
   stream: MediaStream | null;
+  needsManualFlash: boolean;
   startMeasurement: () => Promise<void>;
   stopMeasurement: () => void;
+  confirmManualFlash: () => void;
 }
 
 const BUFFER_SIZE = 150; // 약 5초 분량 (30 FPS 기준)
@@ -21,18 +23,19 @@ export function useCameraHeartRate(): CameraHeartRateResult {
   const [waveform, setWaveform] = useState<number[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
+  const [needsManualFlash, setNeedsManualFlash] = useState<boolean>(false);
   
+  // NATIVE_MIGRATION_NOTE: 네이티브 앱(React Native) 설정 시 아래 DOM 객체 기반 부분은 완전히 제거됩니다.
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafId = useRef<number | null>(null);
   const lastDrawTime = useRef<number>(0);
   
-  // 알고리즘 변수
   const rawSignalBuffer = useRef<number[]>([]);
   const timeBuffer = useRef<number[]>([]);
   const peakTimestamps = useRef<number[]>([]);
-  const currentBpmRef = useRef<number | null>(null); // EMA 적용을 위해 직전 BPM 저장
+  const currentBpmRef = useRef<number | null>(null);
 
   const stopMeasurement = useCallback(() => {
     if (rafId.current) cancelAnimationFrame(rafId.current);
@@ -47,37 +50,40 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     setStatus('idle');
     setBpm(null);
     setWaveform([]);
+    setNeedsManualFlash(false);
     rawSignalBuffer.current = [];
     timeBuffer.current = [];
     peakTimestamps.current = [];
     currentBpmRef.current = null;
   }, []);
 
+  const confirmManualFlash = useCallback(() => {
+    setNeedsManualFlash(false);
+    setStatus('measuring'); 
+    // 정지 상태였다면 다시 루프 시작
+    if (rafId.current) cancelAnimationFrame(rafId.current);
+    rafId.current = requestAnimationFrame(processFrame);
+  }, []);
+
   const calculateBPM = useCallback(() => {
     const raw = rawSignalBuffer.current;
-    if (raw.length < 30) return; // 최소 1초 이상의 데이터 수집 대기
+    if (raw.length < 30) return; 
 
-    // 1. Data Normalization (실시간 최소/최대값 기준 영점 조정 및 스케일링)
-    // 최근 2초(60프레임) 데이터만 분석하여 환경(광량/압력) 변화에 강건하게 반응
     const recentRaw = raw.slice(-60);
     const minRaw = Math.min(...recentRaw);
     const maxRaw = Math.max(...recentRaw);
     const range = maxRaw - minRaw;
 
-    // 노이즈(파장이 전혀 없는 상태) 무시
     if (range < 0.5) return; 
 
     const filtered: number[] = [];
     const timestamps = timeBuffer.current;
 
     for (let i = 0; i < raw.length; i++) {
-        // High-pass 대체: 윈도우 기반 Min/Max 보정으로 DC offset(기울어짐) 제거
         const normalized = (raw[i] - minRaw) / range;
         filtered.push(normalized);
     }
     
-    // 2. Low-pass Filter (Moving Average)
-    // 자잘한 프레임 노이즈 및 손떨림 고주파 제거
     const smoothed: number[] = [];
     const windowSize = 5;
     for (let i = 0; i < filtered.length; i++) {
@@ -90,24 +96,18 @@ export function useCameraHeartRate(): CameraHeartRateResult {
         }
     }
 
-    // Waveform UI 업데이트 (최근 100프레임)
     setWaveform(smoothed.slice(-100));
 
-    // 3. Peak Detection (부드러운 신호 위에서 피크 찾기)
     if (smoothed.length < 3) return;
     
     const v0 = smoothed[smoothed.length - 3];
     const v1 = smoothed[smoothed.length - 2];
     const v2 = smoothed[smoothed.length - 1];
     
-    // 진폭이 정규화 평균치(0.5)를 넘는 명확한 최고점인지 검사
     if (v1 > v0 && v1 > v2 && v1 > 0.4) { 
         const peakTime = timestamps[timestamps.length - 2];
         const lastPeakTime = peakTimestamps.current[peakTimestamps.current.length - 1] || 0;
         
-        // 4. Band-pass Filter (생리학적 주파수 대역 적용)
-        // 0.7Hz ~ 3.5Hz (약 42 BPM ~ 210 BPM)
-        // 피크 간 시간차가 285ms(210 BPM) ~ 1500ms(40 BPM) 이내일 때만 유효 취급
         const timeDiff = peakTime - lastPeakTime;
         
         if (timeDiff > 285 && timeDiff < 1500) {
@@ -121,19 +121,13 @@ export function useCameraHeartRate(): CameraHeartRateResult {
                 for(let i=1; i<peakTimestamps.current.length; i++) {
                     diffs.push(peakTimestamps.current[i] - peakTimestamps.current[i-1]);
                 }
-                // 평균 피크 간격으로 BPM 산출
                 const avgDiff = diffs.reduce((a,b)=>a+b, 0) / diffs.length;
                 let newBpm = 60000 / avgDiff;
                 
-                // 5. Physiological Rules (급격한 심박수 변화 차단)
                 if (currentBpmRef.current !== null) {
                     const oldBpm = currentBpmRef.current;
-                    // 인간의 심박은 1초만에 20% 이상 변하기 어려움 (노이즈 방어)
                     if (newBpm > oldBpm * 1.2) newBpm = oldBpm * 1.2;
                     if (newBpm < oldBpm * 0.8) newBpm = oldBpm * 0.8;
-                    
-                    // 6. Exponential Moving Average (EMA) 적용
-                    // 새로운 측정값 비중 30%, 이전 상태 유지 70%로 극강의 부드러움 제공
                     newBpm = (newBpm * 0.3) + (oldBpm * 0.7);
                 }
                 
@@ -141,17 +135,20 @@ export function useCameraHeartRate(): CameraHeartRateResult {
                 setBpm(Math.round(newBpm));
             }
         } else if (timeDiff > 1500) {
-            // 맥박을 한참 놓쳤거나 신호가 초기화된 경우 기준점 리셋
             peakTimestamps.current = [peakTime];
         }
     }
   }, []);
 
   const processFrame = useCallback((timestamp: number) => {
+    // NATIVE_MIGRATION_NOTE: 네이티브 앱 전환 시, 이 함수 전체(Canvas 순회)를 날리고 Frame Processor를 사용합니다.
     if (!videoElementRef.current || !canvasRef.current) return;
     
-    // 재귀 호출
     rafId.current = requestAnimationFrame(processFrame);
+
+    // 수동 제어(손전등 대기) 중인 경우 연산 블록
+    // 여기서 return만 해도 콜백은 계속 등록되므로 프레임은 대기함
+    if (needsManualFlash) return;
 
     if (timestamp - lastDrawTime.current < FPS_INTERVAL) return;
     lastDrawTime.current = timestamp;
@@ -164,7 +161,6 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // 중앙 50x50 추출 최적화
     const sampleSize = 50;
     const sx = Math.max(0, (video.videoWidth - sampleSize) / 2);
     const sy = Math.max(0, (video.videoHeight - sampleSize) / 2);
@@ -185,23 +181,20 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     const greenAvg = greenSum / count;
     const blueAvg = blueSum / count;
     
-    // 손가락 접촉 판별 (혈류 조직 투과 시 붉은 빛 압도적)
     if (redAvg > 100 && redAvg > greenAvg * 1.3 && redAvg > blueAvg * 1.3) {
        setStatus('measuring');
        
        rawSignalBuffer.current.push(redAvg);
-       timeBuffer.current.push(timestamp); // 타임스탬프 기록
+       timeBuffer.current.push(timestamp);
        
        if (rawSignalBuffer.current.length > BUFFER_SIZE) {
            rawSignalBuffer.current.shift();
            timeBuffer.current.shift();
        }
        
-       // 알고리즘 호출
        calculateBPM();
        
     } else {
-       // 손가락이 떨어지거나 부적절할 경우 완벽히 상태 초기화
        setStatus('no_finger');
        setBpm(null);
        currentBpmRef.current = null;
@@ -210,19 +203,45 @@ export function useCameraHeartRate(): CameraHeartRateResult {
        peakTimestamps.current = [];
        setWaveform([]);
     }
-  }, [calculateBPM]);
+  }, [calculateBPM, needsManualFlash]);
 
   const startMeasurement = async () => {
     try {
       setStatus('initializing');
       setErrorMsg(null);
+      setNeedsManualFlash(false);
       
+      // NATIVE_MIGRATION_NOTE: 네이티브 앱에서는 enumerateDevices 대신 expo-camera 등의 device 속성(device='back') 하나로 끝납니다.
+      // 1. 임시 스트림 통과 (iOS 라벨 읽기용)
+      const dummyStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      
+      let bestDeviceId: string | null = null;
+      for (const device of videoDevices) {
+          const label = device.label.toLowerCase();
+          // 아이폰 다중 렌즈 자동전환 방지를 위한 메인 렌즈 색출
+          if (label.includes('back') || label.includes('후면')) {
+              if (!label.includes('ultra') && !label.includes('telephoto')) {
+                  bestDeviceId = device.deviceId;
+                  break;
+              }
+          }
+      }
+
+      dummyStream.getTracks().forEach(t => t.stop());
+
+      // 2. 최적 렌즈로 진짜 스트림 연결
       let stream: MediaStream;
+      const constraints: MediaStreamConstraints = {
+          video: bestDeviceId 
+              ? { deviceId: { exact: bestDeviceId } }
+              : { facingMode: { ideal: 'environment' } },
+          audio: false
+      };
+      
       try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { exact: 'environment' } },
-            audio: false
-          });
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
       } catch(e) {
           stream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: 'environment' }, 
@@ -243,6 +262,9 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       videoElementRef.current.srcObject = stream;
       await videoElementRef.current.play();
 
+      // NATIVE_MIGRATION_NOTE: 네이티브 앱에서는 Torch 제어가 보장되므로, 수동 플래시 모달 시스템 전체 파기가 가능합니다.
+      // 3. 플래시 비동기 켜기 및 권한 에러 분별
+      let flashSuccess = false;
       const track = stream.getVideoTracks()[0];
       if (track) {
           try {
@@ -251,9 +273,10 @@ export function useCameraHeartRate(): CameraHeartRateResult {
                  await track.applyConstraints({
                      advanced: [{ torch: true } as any]
                  });
+                 flashSuccess = true;
               }
           } catch (e) {
-              console.warn("이 브라우저는 플래시 제어를 지원하지 않음", e);
+              console.warn("브라우저 환경 플래시 제어 불가. 상태값 전환(에러 분리)");
           }
       }
       
@@ -261,6 +284,13 @@ export function useCameraHeartRate(): CameraHeartRateResult {
           canvasRef.current = document.createElement('canvas');
           canvasRef.current.width = 50;
           canvasRef.current.height = 50;
+      }
+      
+      if (!flashSuccess) {
+          // 모달 유도 상태 방출
+          setNeedsManualFlash(true);
+      } else {
+          setStatus('idle');
       }
       
       rafId.current = requestAnimationFrame(processFrame);
@@ -278,5 +308,15 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     };
   }, [stopMeasurement]);
 
-  return { bpm, status, waveform, error: errorMsg, stream: activeStream, startMeasurement, stopMeasurement };
+  return { 
+      bpm, 
+      status, 
+      waveform, 
+      error: errorMsg, 
+      stream: activeStream, 
+      needsManualFlash, 
+      startMeasurement, 
+      stopMeasurement,
+      confirmManualFlash
+  };
 }

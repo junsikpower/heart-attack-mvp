@@ -9,8 +9,8 @@ export default function App() {
   const [currentScreen, setCurrentScreen] = useState<Screen>('lobby');
   const [currentMode, setCurrentMode] = useState<Mode>(null);
 
-  // 카메라 심박수 훅
-  const { bpm, status, waveform, error, stream, startMeasurement } = useCameraHeartRate();
+  // 카메라 심박수 훅 (UI에 절대적으로 종속적이지 않은 독립적 상태 제공)
+  const { bpm, status, waveform, error, stream, needsManualFlash, startMeasurement, confirmManualFlash } = useCameraHeartRate();
 
   const handleStart = (mode: Mode) => {
     // 만약 측정을 켜지 않고 시작을 누르면 그냥 넘기되 카메라 기반 기능을 못쓴다는 것을 인지 
@@ -40,6 +40,28 @@ export default function App() {
       )}
       {currentScreen === 'game' && currentMode === 'voice' && (
         <VoiceGameScreen bpm={bpm} status={status} waveform={waveform} startMeasurement={startMeasurement} />
+      )}
+
+      {/* NATIVE_MIGRATION_NOTE: 네이티브 앱 제작 시, 하드웨어 플래시 제어가 보장되므로 이 모달(전체) 레이어는 삭제 가능합니다. */}
+      {needsManualFlash && (
+        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex flex-col items-center justify-center p-6">
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 md:p-8 max-w-sm w-full flex flex-col items-center text-center shadow-[0_0_50px_rgba(239,68,68,0.2)]">
+            <div className="w-16 h-16 bg-gray-800 rounded-full flex items-center justify-center mb-6 border-2 border-yellow-500/50 shadow-[0_0_15px_rgba(234,179,8,0.3)]">
+              <AlertCircle className="w-8 h-8 text-yellow-500" />
+            </div>
+            <h2 className="text-xl font-bold text-white mb-3">수동 조작 필요</h2>
+            <p className="text-sm text-gray-400 mb-6 leading-relaxed">
+              아이폰 등 일부 기기의 정책 상, 웹 브라우저가 <strong className="text-white">카메라 플래시</strong>를 자동으로 제어할 수 없습니다.<br/><br/>
+              안정적인 심박 측정을 위해 지금 <strong>화면 상단을 쓸어내려 제어 센터에서 손전등(🔦)</strong>을 최대 밝기로 켜주세요.
+            </p>
+            <button
+              onClick={confirmManualFlash}
+              className="w-full py-4 bg-red-600 hover:bg-red-500 active:scale-95 transition-all text-white font-bold rounded-xl shadow-[0_4px_20px_rgba(220,38,38,0.4)]"
+            >
+              네, 손전등을 켰습니다
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );
