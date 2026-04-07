@@ -10,7 +10,7 @@ export default function App() {
   const [currentMode, setCurrentMode] = useState<Mode>(null);
 
   // 카메라 심박수 훅
-  const { bpm, status, waveform, error, videoRef, startMeasurement } = useCameraHeartRate();
+  const { bpm, status, waveform, error, stream, startMeasurement } = useCameraHeartRate();
 
   const handleStart = (mode: Mode) => {
     // 만약 측정을 켜지 않고 시작을 누르면 그냥 넘기되 카메라 기반 기능을 못쓴다는 것을 인지 
@@ -29,17 +29,17 @@ export default function App() {
           status={status}
           bpm={bpm}
           error={error}
-          videoRef={videoRef}
+          stream={stream}
         />
       )}
       {currentScreen === 'matching' && (
         <MatchingScreen onMatchFound={() => setCurrentScreen('game')} />
       )}
       {currentScreen === 'game' && currentMode === 'text' && (
-        <TextGameScreen bpm={bpm} status={status} waveform={waveform} />
+        <TextGameScreen bpm={bpm} status={status} waveform={waveform} startMeasurement={startMeasurement} />
       )}
       {currentScreen === 'game' && currentMode === 'voice' && (
-        <VoiceGameScreen bpm={bpm} status={status} waveform={waveform} />
+        <VoiceGameScreen bpm={bpm} status={status} waveform={waveform} startMeasurement={startMeasurement} />
       )}
     </div>
   );
@@ -119,6 +119,21 @@ function WaveformCanvas({ data, status }: { data: number[], status: MeasurementS
 }
 
 // ==========================================
+// 공용: Video Preview (스트림 연결용)
+// ==========================================
+function VideoPreview({ stream }: { stream: MediaStream | null }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  return <video ref={videoRef} className="w-full h-full object-cover opacity-60" muted playsInline autoPlay />;
+}
+
+// ==========================================
 // 화면 1: 게임 로비 (시작 화면)
 // ==========================================
 function LobbyScreen({
@@ -128,7 +143,7 @@ function LobbyScreen({
   status,
   bpm,
   error,
-  videoRef
+  stream
 }: {
   onStartText: () => void;
   onStartVoice: () => void;
@@ -136,7 +151,7 @@ function LobbyScreen({
   status: MeasurementStatus;
   bpm: number | null;
   error: string | null;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
+  stream: MediaStream | null;
 }) {
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-4">
@@ -178,7 +193,7 @@ function LobbyScreen({
                 <div className="flex flex-col items-center justify-center w-full space-y-3">
                     <div className="relative w-16 h-16 rounded-full overflow-hidden border-2 border-red-500 bg-gray-900 shadow-[0_0_15px_rgba(239,68,68,0.3)]">
                         {/* 카메라 미리보기 화면을 작게 띄워줘 손가락 위치를 확인시킴 */}
-                        <video ref={videoRef} className="w-full h-full object-cover opacity-60" muted playsInline />
+                        <VideoPreview stream={stream} />
                         {status === 'no_finger' && (
                             <div className="absolute inset-0 bg-red-900/80 flex items-center justify-center text-[10px] text-center font-bold">
                                 렌즈<br/>덮기
@@ -251,28 +266,39 @@ function MatchingScreen({ onMatchFound }: { onMatchFound: () => void }) {
 // ==========================================
 // 공통 컴포넌트: 게임 상단 헤더 (심박수 표시 + 파형)
 // ==========================================
-function GameHeader({ bpm, status, waveform }: { bpm: number | null; status: MeasurementStatus; waveform: number[] }) {
+function GameHeader({ bpm, status, waveform, startMeasurement }: { bpm: number | null; status: MeasurementStatus; waveform: number[]; startMeasurement: () => void }) {
   const isMeasuring = status === 'measuring';
   const showBpm = bpm !== null && isMeasuring;
 
   return (
     <header className="flex flex-col border-b border-red-900/40 bg-black/90 backdrop-blur-md sticky top-0 z-10">
         <div className="flex items-center justify-between p-5 pb-3">
-          {/* 내 심박수 */}
-          <div className="flex flex-col items-center w-24 relative">
+          {/* 내 심박수 영역 */}
+          <div className="flex flex-col items-center w-28 relative">
             <span className="text-xs text-gray-400 mb-1 font-medium tracking-wider">MY BPM</span>
-            <div className="flex items-center space-x-2">
-              <Heart
-                className="w-5 h-5 text-red-500 animate-pulse"
-                fill="currentColor"
-                style={{ animationDuration: showBpm ? `${60 / bpm}s` : '0.8s' }}
-              />
-              <span className={`text-3xl font-mono font-bold drop-shadow-[0_0_8px_rgba(255,255,255,0.5)] ${status === 'no_finger' ? 'text-red-500' : 'text-white'}`}>
-                {showBpm ? bpm : '--'}
-              </span>
-            </div>
+            
+            {(status === 'idle' || status === 'error') ? (
+               <button 
+                 onClick={startMeasurement}
+                 className="mt-1 px-3 py-1.5 bg-red-600 rounded whitespace-nowrap text-xs font-bold shadow-[0_0_10px_rgba(239,68,68,0.5)] hover:bg-red-500 active:scale-95"
+               >
+                  카메라 측정 켜기
+               </button>
+            ) : (
+               <div className="flex items-center space-x-2">
+                 <Heart
+                   className="w-5 h-5 text-red-500 animate-pulse"
+                   fill="currentColor"
+                   style={{ animationDuration: showBpm ? `${60 / bpm}s` : '0.8s' }}
+                 />
+                 <span className={`text-3xl font-mono font-bold drop-shadow-[0_0_8px_rgba(255,255,255,0.5)] ${status === 'no_finger' ? 'text-red-500' : 'text-white'}`}>
+                   {showBpm ? bpm : '--'}
+                 </span>
+               </div>
+            )}
+            
             {status === 'no_finger' && (
-                <span className="absolute -bottom-4 text-[10px] text-red-500 whitespace-nowrap overflow-visible">손가락으로 가리세요</span>
+                <span className="absolute -bottom-4 text-[10px] text-red-500 whitespace-nowrap overflow-visible">손가락 덮으세요</span>
             )}
           </div>
 
@@ -300,9 +326,9 @@ function GameHeader({ bpm, status, waveform }: { bpm: number | null; status: Mea
 // ==========================================
 // 화면 3-A: 본 게임 (텍스트 채팅) 화면
 // ==========================================
-function TextGameScreen({ bpm, status, waveform }: { bpm: number | null; status: MeasurementStatus; waveform: number[] }) {
+function TextGameScreen({ bpm, status, waveform, startMeasurement }: { bpm: number | null; status: MeasurementStatus; waveform: number[]; startMeasurement: () => void }) {
   const [messages, setMessages] = useState<{ id: number; text: string; sender: 'me' | 'partner' }[]>([
-    { id: 1, text: '안녕하세요! 카메라 렌즈를 덮고 시작해봅시다.', sender: 'partner' },
+    { id: 1, text: '안녕하세요! 직접 타이핑해서 공격해볼까요?', sender: 'partner' },
   ]);
   const [inputText, setInputText] = useState('');
 
@@ -315,7 +341,7 @@ function TextGameScreen({ bpm, status, waveform }: { bpm: number | null; status:
 
   return (
     <div className="flex flex-col h-screen max-w-2xl mx-auto border-x border-gray-900 bg-black relative">
-      <GameHeader bpm={bpm} status={status} waveform={waveform} />
+      <GameHeader bpm={bpm} status={status} waveform={waveform} startMeasurement={startMeasurement} />
 
       <main className="flex-1 p-4 overflow-y-auto space-y-4 scroll-smooth">
         {messages.map(msg => (
@@ -356,10 +382,10 @@ function TextGameScreen({ bpm, status, waveform }: { bpm: number | null; status:
 // ==========================================
 // 화면 3-B: 본 게임 (음성 대화) 화면
 // ==========================================
-function VoiceGameScreen({ bpm, status, waveform }: { bpm: number | null; status: MeasurementStatus; waveform: number[] }) {
+function VoiceGameScreen({ bpm, status, waveform, startMeasurement }: { bpm: number | null; status: MeasurementStatus; waveform: number[]; startMeasurement: () => void }) {
   return (
     <div className="flex flex-col h-screen max-w-2xl mx-auto border-x border-gray-900 bg-black relative">
-      <GameHeader bpm={bpm} status={status} waveform={waveform} />
+      <GameHeader bpm={bpm} status={status} waveform={waveform} startMeasurement={startMeasurement} />
 
       <main className="flex-1 flex flex-col">
         {/* 상대방 */}

@@ -7,7 +7,7 @@ interface CameraHeartRateResult {
   status: MeasurementStatus;
   waveform: number[];
   error: string | null;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
+  stream: MediaStream | null;
   startMeasurement: () => Promise<void>;
   stopMeasurement: () => void;
 }
@@ -20,8 +20,9 @@ export function useCameraHeartRate(): CameraHeartRateResult {
   const [status, setStatus] = useState<MeasurementStatus>('idle');
   const [waveform, setWaveform] = useState<number[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
   
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafId = useRef<number | null>(null);
@@ -37,6 +38,10 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
     }
+    if (videoElementRef.current) {
+      videoElementRef.current.srcObject = null;
+    }
+    setActiveStream(null);
     setStatus('idle');
     setBpm(null);
     setWaveform([]);
@@ -100,20 +105,22 @@ export function useCameraHeartRate(): CameraHeartRateResult {
   }, []);
 
   const processFrame = useCallback((timestamp: number) => {
-    if (!videoRef.current || !canvasRef.current) return;
+    // DOM에 의존하지 않고 메모리 내의 비디오 요소 사용
+    if (!videoElementRef.current || !canvasRef.current) return;
     
+    // 루프 재귀호출은 가장 위에서 보장 (조기 리턴 방지)
+    rafId.current = requestAnimationFrame(processFrame);
+
     if (timestamp - lastDrawTime.current < FPS_INTERVAL) {
-        rafId.current = requestAnimationFrame(processFrame);
         return;
     }
     lastDrawTime.current = timestamp;
 
-    const video = videoRef.current;
+    const video = videoElementRef.current;
     const canvas = canvasRef.current;
     
     // 비디오가 재생 중일때만 처리
     if (video.videoWidth === 0 || video.videoHeight === 0) {
-        rafId.current = requestAnimationFrame(processFrame);
         return;
     }
 
@@ -168,8 +175,6 @@ export function useCameraHeartRate(): CameraHeartRateResult {
        peakTimestamps.current = [];
        setWaveform([]);
     }
-    
-    rafId.current = requestAnimationFrame(processFrame);
   }, [calculateBPM]);
 
   const startMeasurement = async () => {
@@ -193,12 +198,18 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       }
       
       streamRef.current = stream;
+      setActiveStream(stream);
       
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.setAttribute("playsinline", "true"); // 모바일 브라우저 팝업 방지
-        await videoRef.current.play();
+      // 화면 렌더링과 독립적인 비디오 요소 메모리 생성
+      if (!videoElementRef.current) {
+        const vid = document.createElement('video');
+        vid.setAttribute("playsinline", "true");
+        vid.muted = true;
+        videoElementRef.current = vid;
       }
+      
+      videoElementRef.current.srcObject = stream;
+      await videoElementRef.current.play();
 
       // 플래시(Torch) 켜기 시도
       const track = stream.getVideoTracks()[0];
@@ -237,5 +248,5 @@ export function useCameraHeartRate(): CameraHeartRateResult {
     };
   }, [stopMeasurement]);
 
-  return { bpm, status, waveform, error: errorMsg, videoRef, startMeasurement, stopMeasurement };
+  return { bpm, status, waveform, error: errorMsg, stream: activeStream, startMeasurement, stopMeasurement };
 }
