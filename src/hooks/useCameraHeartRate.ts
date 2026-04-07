@@ -177,10 +177,20 @@ export function useCameraHeartRate(): CameraHeartRateResult {
       setStatus('initializing');
       setErrorMsg(null);
       
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }, // 후면 카메라 우선
-        audio: false
-      });
+      let stream: MediaStream;
+      try {
+          // 1. 강제로 후면 카메라 (exact) 요청
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { exact: 'environment' } },
+            audio: false
+          });
+      } catch(e) {
+          // 2. 만약 실패할 경우 (PC 등 후면카메라가 없는 기기) 차선책으로 기본 요청
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment' }, 
+            audio: false
+          });
+      }
       
       streamRef.current = stream;
       
